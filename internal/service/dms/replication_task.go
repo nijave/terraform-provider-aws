@@ -229,6 +229,13 @@ func resourceReplicationTaskUpdate(ctx context.Context, d *schema.ResourceData, 
 	var diags diag.Diagnostics
 	conn := meta.(*conns.AWSClient).DMSClient(ctx)
 
+	if d.HasChangesExcept(names.AttrTags, names.AttrTagsAll) {
+		// Stop, modify, and move all require a task that is not mid-transition.
+		if _, err := waitReplicationTaskSteady(ctx, conn, d.Id()); err != nil {
+			return sdkdiag.AppendErrorf(diags, "waiting for DMS Replication Task (%s) steady state: %s", d.Id(), err)
+		}
+	}
+
 	if d.HasChangesExcept(names.AttrTags, names.AttrTagsAll, "replication_instance_arn", "start_replication_task") {
 		if err := stopReplicationTask(ctx, conn, d.Id()); err != nil {
 			return sdkdiag.AppendFromErr(diags, err)
@@ -555,13 +562,35 @@ func waitReplicationTaskStopped(ctx context.Context, conn *dms.Client, id string
 	return nil, err
 }
 
+// Every replication task status in the DMS API reference is either
+// transitional (pending) or settled (target) for waitReplicationTaskSteady.
+// https://docs.aws.amazon.com/dms/latest/APIReference/API_ReplicationTask.html
+var (
+	replicationTaskSteadyPendingStatuses = []string{
+		replicationTaskStatusCreating,
+		replicationTaskStatusDeleting,
+		replicationTaskStatusModifying,
+		replicationTaskStatusMoving,
+		replicationTaskStatusStarting,
+		replicationTaskStatusStopping,
+		replicationTaskStatusTesting,
+	}
+	replicationTaskSteadyTargetStatuses = []string{
+		replicationTaskStatusFailed,
+		replicationTaskStatusFailedMove,
+		replicationTaskStatusReady,
+		replicationTaskStatusRunning,
+		replicationTaskStatusStopped,
+	}
+)
+
 func waitReplicationTaskSteady(ctx context.Context, conn *dms.Client, id string) (*awstypes.ReplicationTask, error) {
 	const (
 		timeout = 5 * time.Minute
 	)
 	stateConf := &retry.StateChangeConf{
-		Pending:                   []string{replicationTaskStatusCreating, replicationTaskStatusDeleting, replicationTaskStatusModifying, replicationTaskStatusStopping, replicationTaskStatusStarting},
-		Target:                    []string{replicationTaskStatusFailed, replicationTaskStatusReady, replicationTaskStatusStopped, replicationTaskStatusRunning},
+		Pending:                   replicationTaskSteadyPendingStatuses,
+		Target:                    replicationTaskSteadyTargetStatuses,
 		Refresh:                   statusReplicationTask(conn, id),
 		Timeout:                   timeout,
 		MinTimeout:                10 * time.Second,

@@ -7,6 +7,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1394,3 +1395,19 @@ var (
 	//go:embed testdata/replication_task/defaults/full-load-and-cdc.json
 	defaultReplicationTaskFullLoadAndCdcSettings string
 )
+
+func TestReplicationTaskSteadyStatusesCoverDocumentedStatuses(t *testing.T) {
+	t.Parallel()
+
+	// Status values from https://docs.aws.amazon.com/dms/latest/APIReference/API_ReplicationTask.html
+	documented := []string{"creating", "deleting", "failed", "failed-move", "modifying", "moving", "ready", "running", "starting", "stopped", "stopping", "testing"}
+
+	for _, status := range documented {
+		pending := slices.Contains(tfdms.ReplicationTaskSteadyPendingStatuses, status)
+		target := slices.Contains(tfdms.ReplicationTaskSteadyTargetStatuses, status)
+
+		if pending == target {
+			t.Errorf("status %q: pending=%t target=%t, want exactly one", status, pending, target)
+		}
+	}
+}
