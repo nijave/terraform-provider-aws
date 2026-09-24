@@ -197,7 +197,7 @@ func resourceReplicationTaskCreate(ctx context.Context, d *schema.ResourceData, 
 	}
 
 	if d.Get("start_replication_task").(bool) {
-		if err := startReplicationTask(createCtx, conn, d.Id()); err != nil {
+		if err := testConnectionsAndStartReplicationTask(createCtx, conn, d.Id()); err != nil {
 			return sdkdiag.AppendFromErr(diags, err)
 		}
 	}
@@ -290,7 +290,7 @@ func resourceReplicationTaskUpdate(ctx context.Context, d *schema.ResourceData, 
 		}
 
 		if d.Get("start_replication_task").(bool) {
-			if err := startReplicationTask(updateCtx, conn, d.Id()); err != nil {
+			if err := testConnectionsAndStartReplicationTask(updateCtx, conn, d.Id()); err != nil {
 				return sdkdiag.AppendFromErr(diags, err)
 			}
 		}
@@ -317,7 +317,7 @@ func resourceReplicationTaskUpdate(ctx context.Context, d *schema.ResourceData, 
 		}
 
 		if d.Get("start_replication_task").(bool) {
-			if err := startReplicationTask(updateCtx, conn, d.Id()); err != nil {
+			if err := testConnectionsAndStartReplicationTask(updateCtx, conn, d.Id()); err != nil {
 				return sdkdiag.AppendFromErr(diags, err)
 			}
 		}
@@ -326,7 +326,7 @@ func resourceReplicationTaskUpdate(ctx context.Context, d *schema.ResourceData, 
 	if d.HasChanges("start_replication_task") {
 		var f func(context.Context, *dms.Client, string) error
 		if d.Get("start_replication_task").(bool) {
-			f = startReplicationTask
+			f = testConnectionsAndStartReplicationTask
 		} else {
 			f = stopReplicationTask
 		}
@@ -628,6 +628,61 @@ func startReplicationTask(ctx context.Context, conn *dms.Client, id string) erro
 
 	if _, err := waitReplicationTaskRunning(ctx, conn, id); err != nil {
 		return fmt.Errorf("waiting for DMS Replication Task (%s) start: %w", id, err)
+	}
+
+	return nil
+}
+
+// testConnectionsAndStartReplicationTask starts a replication task after making
+// sure the connections between its replication instance and its source and
+// target endpoints have been tested successfully. StartReplicationTask fails with
+// InvalidResourceStateFault when either connection has not.
+func testConnectionsAndStartReplicationTask(ctx context.Context, conn *dms.Client, id string) error {
+	if err := ensureReplicationTaskConnectionsSucceeded(ctx, conn, id); err != nil {
+		return err
+	}
+
+	return startReplicationTask(ctx, conn, id)
+}
+
+func ensureReplicationTaskConnectionsSucceeded(ctx context.Context, conn *dms.Client, id string) error {
+	task, err := findReplicationTaskByID(ctx, conn, id)
+
+	if err != nil {
+		return fmt.Errorf("reading DMS Replication Task (%s): %w", id, err)
+	}
+
+	replicationInstanceARN := aws.ToString(task.ReplicationInstanceArn)
+	for _, endpointARN := range []string{aws.ToString(task.SourceEndpointArn), aws.ToString(task.TargetEndpointArn)} {
+		connection, err := findConnectionByEndpointAndReplicationInstanceARNs(ctx, conn, endpointARN, replicationInstanceARN)
+
+		switch {
+		case retry.NotFound(err):
+			// Never tested: test it below.
+		case err != nil:
+			return fmt.Errorf("reading DMS Connection (%s, %s): %w", replicationInstanceARN, endpointARN, err)
+		case aws.ToString(connection.Status) == connectionStatusSuccessful:
+			continue
+		case aws.ToString(connection.Status) == connectionStatusTesting:
+			if _, err := waitConnectionForReplicationInstanceSucceeded(ctx, conn, endpointARN, replicationInstanceARN); err != nil {
+				return fmt.Errorf("waiting for DMS Connection (%s, %s) test: %w", replicationInstanceARN, endpointARN, err)
+			}
+			continue
+		}
+
+		input := dms.TestConnectionInput{
+			EndpointArn:            aws.String(endpointARN),
+			ReplicationInstanceArn: aws.String(replicationInstanceARN),
+		}
+		_, err = conn.TestConnection(ctx, &input)
+
+		if err != nil && !errs.IsAErrorMessageContains[*awstypes.InvalidResourceStateFault](err, "already being tested") {
+			return fmt.Errorf("testing DMS Connection (%s, %s): %w", replicationInstanceARN, endpointARN, err)
+		}
+
+		if _, err := waitConnectionForReplicationInstanceSucceeded(ctx, conn, endpointARN, replicationInstanceARN); err != nil {
+			return fmt.Errorf("waiting for DMS Connection (%s, %s) test: %w", replicationInstanceARN, endpointARN, err)
+		}
 	}
 
 	return nil
