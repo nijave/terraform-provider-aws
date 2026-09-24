@@ -23,16 +23,18 @@ const (
 	replicationInstanceStatusModifying = "modifying"
 	replicationInstanceStatusUpgrading = "upgrading"
 
-	replicationTaskStatusCreating  = "creating"
-	replicationTaskStatusDeleting  = "deleting"
-	replicationTaskStatusFailed    = "failed"
-	replicationTaskStatusModifying = "modifying"
-	replicationTaskStatusMoving    = "moving"
-	replicationTaskStatusReady     = "ready"
-	replicationTaskStatusStopped   = "stopped"
-	replicationTaskStatusStopping  = "stopping"
-	replicationTaskStatusRunning   = "running"
-	replicationTaskStatusStarting  = "starting"
+	replicationTaskStatusCreating   = "creating"
+	replicationTaskStatusDeleting   = "deleting"
+	replicationTaskStatusFailed     = "failed"
+	replicationTaskStatusFailedMove = "failed-move"
+	replicationTaskStatusModifying  = "modifying"
+	replicationTaskStatusMoving     = "moving"
+	replicationTaskStatusReady      = "ready"
+	replicationTaskStatusStopped    = "stopped"
+	replicationTaskStatusStopping   = "stopping"
+	replicationTaskStatusRunning    = "running"
+	replicationTaskStatusStarting   = "starting"
+	replicationTaskStatusTesting    = "testing"
 )
 
 const (

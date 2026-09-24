@@ -17,19 +17,21 @@ var (
 	ResourceReplicationTask        = resourceReplicationTask
 	ResourceS3Endpoint             = resourceS3Endpoint
 
-	FindCertificateByID            = findCertificateByID
-	FindDataProviderByARN          = findDataProviderByARN
-	FindEndpointByID               = findEndpointByID
-	FindEventSubscriptionByName    = findEventSubscriptionByName
-	FindInstanceProfileByARN       = findInstanceProfileByARN
-	FindMigrationProjectByARN      = findMigrationProjectByARN
-	FindReplicationConfigByARN     = findReplicationConfigByARN
-	FindReplicationInstanceByID    = findReplicationInstanceByID
-	FindReplicationSubnetGroupByID = findReplicationSubnetGroupByID
-	FindReplicationTaskByID        = findReplicationTaskByID
-	TaskSettingsEqual              = taskSettingsEqual
-	ValidEndpointID                = validEndpointID
-	ValidReplicationInstanceID     = validReplicationInstanceID
-	ValidReplicationSubnetGroupID  = validReplicationSubnetGroupID
-	ValidReplicationTaskID         = validReplicationTaskID
+	FindCertificateByID                  = findCertificateByID
+	FindDataProviderByARN                = findDataProviderByARN
+	FindEndpointByID                     = findEndpointByID
+	FindEventSubscriptionByName          = findEventSubscriptionByName
+	FindInstanceProfileByARN             = findInstanceProfileByARN
+	FindMigrationProjectByARN            = findMigrationProjectByARN
+	FindReplicationConfigByARN           = findReplicationConfigByARN
+	FindReplicationInstanceByID          = findReplicationInstanceByID
+	FindReplicationSubnetGroupByID       = findReplicationSubnetGroupByID
+	FindReplicationTaskByID              = findReplicationTaskByID
+	ReplicationTaskSteadyPendingStatuses = replicationTaskSteadyPendingStatuses
+	ReplicationTaskSteadyTargetStatuses  = replicationTaskSteadyTargetStatuses
+	TaskSettingsEqual                    = taskSettingsEqual
+	ValidEndpointID                      = validEndpointID
+	ValidReplicationInstanceID           = validReplicationInstanceID
+	ValidReplicationSubnetGroupID        = validReplicationSubnetGroupID
+	ValidReplicationTaskID               = validReplicationTaskID
 )
