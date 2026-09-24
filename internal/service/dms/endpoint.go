@@ -2862,6 +2862,23 @@ func findConnectionByEndpointARN(ctx context.Context, conn *dms.Client, arn stri
 	return findConnection(ctx, conn, &input)
 }
 
+func findConnectionByEndpointAndReplicationInstanceARNs(ctx context.Context, conn *dms.Client, endpointARN, replicationInstanceARN string) (*awstypes.Connection, error) {
+	input := dms.DescribeConnectionsInput{
+		Filters: []awstypes.Filter{
+			{
+				Name:   aws.String("endpoint-arn"),
+				Values: []string{endpointARN},
+			},
+			{
+				Name:   aws.String("replication-instance-arn"),
+				Values: []string{replicationInstanceARN},
+			},
+		},
+	}
+
+	return findConnection(ctx, conn, &input)
+}
+
 func findConnection(ctx context.Context, conn *dms.Client, input *dms.DescribeConnectionsInput) (*awstypes.Connection, error) {
 	output, err := findConnections(ctx, conn, input)
 
@@ -2927,6 +2944,22 @@ func statusConnection(conn *dms.Client, endpointARN string) retry.StateRefreshFu
 	}
 }
 
+func statusConnectionForReplicationInstance(conn *dms.Client, endpointARN, replicationInstanceARN string) retry.StateRefreshFunc {
+	return func(ctx context.Context) (any, string, error) {
+		output, err := findConnectionByEndpointAndReplicationInstanceARNs(ctx, conn, endpointARN, replicationInstanceARN)
+
+		if retry.NotFound(err) {
+			return nil, "", nil
+		}
+
+		if err != nil {
+			return nil, "", err
+		}
+
+		return output, aws.ToString(output.Status), nil
+	}
+}
+
 func waitEndpointDeleted(ctx context.Context, conn *dms.Client, id string, timeout time.Duration) (*awstypes.Endpoint, error) { //nolint:unparam
 	stateConf := &retry.StateChangeConf{
 		Pending: []string{endpointStatusDeleting},
@@ -2950,6 +2983,26 @@ func waitConnectionSucceeded(ctx context.Context, conn *dms.Client, endpointARN 
 		Target:  []string{connectionStatusSuccessful},
 		Refresh: statusConnection(conn, endpointARN),
 		Timeout: timeout,
+		Delay:   5 * time.Second,
+	}
+
+	outputRaw, err := stateConf.WaitForStateContext(ctx)
+
+	if output, ok := outputRaw.(*awstypes.Connection); ok {
+		retry.SetLastError(err, errors.New(aws.ToString(output.LastFailureMessage)))
+		return output, err
+	}
+
+	return nil, err
+}
+
+func waitConnectionForReplicationInstanceSucceeded(ctx context.Context, conn *dms.Client, endpointARN, replicationInstanceARN string) (*awstypes.Connection, error) {
+	deadline, _ := ctx.Deadline()
+	stateConf := &retry.StateChangeConf{
+		Pending: []string{connectionStatusTesting},
+		Target:  []string{connectionStatusSuccessful},
+		Refresh: statusConnectionForReplicationInstance(conn, endpointARN, replicationInstanceARN),
+		Timeout: time.Until(deadline),
 		Delay:   5 * time.Second,
 	}
 
