@@ -15,6 +15,7 @@ import (
 	"github.com/YakDriver/regexache"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/arn"
+	dms "github.com/aws/aws-sdk-go-v2/service/databasemigrationservice"
 	awstypes "github.com/aws/aws-sdk-go-v2/service/databasemigrationservice/types"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
@@ -480,6 +481,51 @@ func TestAccDMSReplicationTask_startReplicationTask(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
 					resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "stopped"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccDMSReplicationTask_updateWhileStopping(t *testing.T) {
+	ctx := acctest.Context(t)
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
+
+	rName := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	resourceName := "aws_dms_replication_task.test"
+	var v awstypes.ReplicationTask
+
+	acctest.ParallelTest(ctx, t, resource.TestCase{
+		PreCheck:                 func() { acctest.PreCheck(ctx, t) },
+		ErrorCheck:               acctest.ErrorCheck(t, names.DMSServiceID),
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories,
+		CheckDestroy:             testAccCheckReplicationTaskDestroy(ctx, t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccReplicationTaskConfig_updateWhileStopping(rName, "testrule"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+					resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "running"),
+				),
+			},
+			{
+				// Ask DMS to stop the task without waiting, so the next apply
+				// finds it in the "stopping" state.
+				PreConfig: func() {
+					conn := acctest.ProviderMeta(ctx, t).DMSClient(ctx)
+					input := dms.StopReplicationTaskInput{
+						ReplicationTaskArn: v.ReplicationTaskArn,
+					}
+					if _, err := conn.StopReplicationTask(ctx, &input); err != nil {
+						t.Fatalf("stopping DMS Replication Task: %s", err)
+					}
+				},
+				Config: testAccReplicationTaskConfig_updateWhileStopping(rName, "changedtestrule"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+					resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "running"),
 				),
 			},
 		},
@@ -1055,6 +1101,49 @@ resource "aws_dms_replication_instance" "test" {
   vpc_security_group_ids       = [aws_security_group.test.id]
 }
 `, rName, startTask, ruleName))
+}
+
+func testAccReplicationTaskConfig_updateWhileStopping(rName, ruleName string) string {
+	return acctest.ConfigCompose(testAccReplicationConfigConfig_base_ValidDatabase(rName), fmt.Sprintf(`
+resource "aws_dms_replication_task" "test" {
+  replication_task_id      = %[1]q
+  migration_type           = "full-load-and-cdc"
+  replication_instance_arn = aws_dms_replication_instance.test.replication_instance_arn
+  source_endpoint_arn      = aws_dms_endpoint.source.endpoint_arn
+  target_endpoint_arn      = aws_dms_endpoint.target.endpoint_arn
+  table_mappings = jsonencode(
+    {
+      "rules" = [
+        {
+          "rule-type" = "selection",
+          "rule-id"   = "1",
+          "rule-name" = %[2]q,
+          "object-locator" = {
+            "schema-name" = "%%",
+            "table-name"  = "%%"
+          },
+          "rule-action" = "include"
+        }
+      ]
+    }
+  )
+
+  start_replication_task = true
+
+  depends_on = [aws_rds_cluster_instance.source, aws_rds_cluster_instance.target]
+}
+
+resource "aws_dms_replication_instance" "test" {
+  allocated_storage            = 5
+  auto_minor_version_upgrade   = true
+  replication_instance_class   = "dms.t3.medium"
+  replication_instance_id      = %[1]q
+  preferred_maintenance_window = "sun:00:30-sun:02:30"
+  publicly_accessible          = false
+  replication_subnet_group_id  = aws_dms_replication_subnet_group.test.replication_subnet_group_id
+  vpc_security_group_ids       = [aws_security_group.test.id]
+}
+`, rName, ruleName))
 }
 
 func testAccReplicationTaskConfig_s3ToRDS(rName string) string {
