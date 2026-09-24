@@ -520,6 +520,36 @@ func TestAccDMSReplicationTask_timeouts(t *testing.T) {
 	})
 }
 
+func TestAccDMSReplicationTask_startSharedEndpoints(t *testing.T) {
+	ctx := acctest.Context(t)
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
+
+	rName := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	resourceName := "aws_dms_replication_task.test"
+	resourceName2 := "aws_dms_replication_task.test2"
+	var v, v2 awstypes.ReplicationTask
+
+	acctest.ParallelTest(ctx, t, resource.TestCase{
+		PreCheck:                 func() { acctest.PreCheck(ctx, t) },
+		ErrorCheck:               acctest.ErrorCheck(t, names.DMSServiceID),
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories,
+		CheckDestroy:             testAccCheckReplicationTaskDestroy(ctx, t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccReplicationTaskConfig_startSharedEndpoints(rName),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+					testAccCheckReplicationTaskExists(ctx, t, resourceName2, &v2),
+					resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "running"),
+					resource.TestCheckResourceAttr(resourceName2, names.AttrStatus, "running"),
+				),
+			},
+		},
+	})
+}
+
 func TestAccDMSReplicationTask_s3ToRDS(t *testing.T) {
 	ctx := acctest.Context(t)
 	rName := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
@@ -1138,6 +1168,88 @@ resource "aws_dms_replication_instance" "test" {
   vpc_security_group_ids       = [aws_security_group.test.id]
 }
 `, rName, ruleName))
+}
+
+func testAccReplicationTaskConfig_startSharedEndpoints(rName string) string {
+	return acctest.ConfigCompose(testAccReplicationConfigConfig_base_ValidDatabase(rName), fmt.Sprintf(`
+resource "aws_dms_replication_task" "test" {
+  replication_task_id      = %[1]q
+  migration_type           = "full-load-and-cdc"
+  replication_instance_arn = aws_dms_replication_instance.test.replication_instance_arn
+  source_endpoint_arn      = aws_dms_endpoint.source.endpoint_arn
+  target_endpoint_arn      = aws_dms_endpoint.target.endpoint_arn
+  table_mappings = jsonencode(
+    {
+      "rules" = [
+        {
+          "rule-type" = "selection",
+          "rule-id"   = "1",
+          "rule-name" = "1",
+          "object-locator" = {
+            "schema-name" = "%%",
+            "table-name"  = "%%"
+          },
+          "rule-action" = "include"
+        }
+      ]
+    }
+  )
+
+  start_replication_task = true
+
+  depends_on = [aws_rds_cluster_instance.source, aws_rds_cluster_instance.target]
+}
+
+resource "aws_dms_replication_task" "test2" {
+  replication_task_id      = "%[1]s-2"
+  migration_type           = "full-load-and-cdc"
+  replication_instance_arn = aws_dms_replication_instance.test2.replication_instance_arn
+  source_endpoint_arn      = aws_dms_endpoint.source.endpoint_arn
+  target_endpoint_arn      = aws_dms_endpoint.target.endpoint_arn
+  table_mappings = jsonencode(
+    {
+      "rules" = [
+        {
+          "rule-type" = "selection",
+          "rule-id"   = "1",
+          "rule-name" = "1",
+          "object-locator" = {
+            "schema-name" = "%%",
+            "table-name"  = "%%"
+          },
+          "rule-action" = "include"
+        }
+      ]
+    }
+  )
+
+  start_replication_task = true
+
+  depends_on = [aws_rds_cluster_instance.source, aws_rds_cluster_instance.target]
+}
+
+resource "aws_dms_replication_instance" "test" {
+  allocated_storage            = 5
+  auto_minor_version_upgrade   = true
+  replication_instance_class   = "dms.t3.medium"
+  replication_instance_id      = %[1]q
+  preferred_maintenance_window = "sun:00:30-sun:02:30"
+  publicly_accessible          = false
+  replication_subnet_group_id  = aws_dms_replication_subnet_group.test.replication_subnet_group_id
+  vpc_security_group_ids       = [aws_security_group.test.id]
+}
+
+resource "aws_dms_replication_instance" "test2" {
+  allocated_storage            = 5
+  auto_minor_version_upgrade   = true
+  replication_instance_class   = "dms.t3.medium"
+  replication_instance_id      = "%[1]s-2"
+  preferred_maintenance_window = "sun:00:30-sun:02:30"
+  publicly_accessible          = false
+  replication_subnet_group_id  = aws_dms_replication_subnet_group.test.replication_subnet_group_id
+  vpc_security_group_ids       = [aws_security_group.test.id]
+}
+`, rName))
 }
 
 func testAccReplicationTaskConfig_s3ToRDS(rName string) string {
