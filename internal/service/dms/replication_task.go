@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"time"
 
 	"github.com/YakDriver/regexache"
@@ -231,8 +232,17 @@ func resourceReplicationTaskUpdate(ctx context.Context, d *schema.ResourceData, 
 
 	if d.HasChangesExcept(names.AttrTags, names.AttrTagsAll) {
 		// Stop, modify, and move all require a task that is not mid-transition.
-		if _, err := waitReplicationTaskSteady(ctx, conn, d.Id()); err != nil {
-			return sdkdiag.AppendErrorf(diags, "waiting for DMS Replication Task (%s) steady state: %s", d.Id(), err)
+		// Only wait when the task is actually mid-transition.
+		task, err := findReplicationTaskByID(ctx, conn, d.Id())
+
+		if err != nil {
+			return sdkdiag.AppendErrorf(diags, "reading DMS Replication Task (%s): %s", d.Id(), err)
+		}
+
+		if slices.Contains(replicationTaskSteadyPendingStatuses, aws.ToString(task.Status)) {
+			if _, err := waitReplicationTaskSteady(ctx, conn, d.Id()); err != nil {
+				return sdkdiag.AppendErrorf(diags, "waiting for DMS Replication Task (%s) steady state: %s", d.Id(), err)
+			}
 		}
 	}
 
