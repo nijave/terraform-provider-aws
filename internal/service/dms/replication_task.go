@@ -636,22 +636,28 @@ func startReplicationTask(ctx context.Context, conn *dms.Client, id string) erro
 // testConnectionsAndStartReplicationTask starts a replication task after making
 // sure the connections between its replication instance and its source and
 // target endpoints have been tested successfully. StartReplicationTask fails with
-// InvalidResourceStateFault when either connection has not.
+// InvalidResourceStateFault when either connection has not. A task that is
+// already running is left alone: startReplicationTask is a no-op for it, and
+// testing its connections again could fail on a stale failed test.
 func testConnectionsAndStartReplicationTask(ctx context.Context, conn *dms.Client, id string) error {
-	if err := ensureReplicationTaskConnectionsSucceeded(ctx, conn, id); err != nil {
-		return err
-	}
-
-	return startReplicationTask(ctx, conn, id)
-}
-
-func ensureReplicationTaskConnectionsSucceeded(ctx context.Context, conn *dms.Client, id string) error {
 	task, err := findReplicationTaskByID(ctx, conn, id)
 
 	if err != nil {
 		return fmt.Errorf("reading DMS Replication Task (%s): %w", id, err)
 	}
 
+	if aws.ToString(task.Status) == replicationTaskStatusRunning {
+		return nil
+	}
+
+	if err := ensureReplicationTaskConnectionsSucceeded(ctx, conn, task); err != nil {
+		return err
+	}
+
+	return startReplicationTask(ctx, conn, id)
+}
+
+func ensureReplicationTaskConnectionsSucceeded(ctx context.Context, conn *dms.Client, task *awstypes.ReplicationTask) error {
 	replicationInstanceARN := aws.ToString(task.ReplicationInstanceArn)
 	for _, endpointARN := range []string{aws.ToString(task.SourceEndpointArn), aws.ToString(task.TargetEndpointArn)} {
 		connection, err := findConnectionByEndpointAndReplicationInstanceARNs(ctx, conn, endpointARN, replicationInstanceARN)
