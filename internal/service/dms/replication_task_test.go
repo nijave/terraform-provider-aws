@@ -22,6 +22,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 	"github.com/hashicorp/terraform-provider-aws/internal/acctest"
 	"github.com/hashicorp/terraform-provider-aws/internal/enum"
+	"github.com/hashicorp/terraform-provider-aws/internal/errs"
 	"github.com/hashicorp/terraform-provider-aws/internal/retry"
 	tfdms "github.com/hashicorp/terraform-provider-aws/internal/service/dms"
 	"github.com/hashicorp/terraform-provider-aws/names"
@@ -1518,12 +1519,16 @@ func testAccCheckReplicationTaskConnectionsStatus(ctx context.Context, t *testin
 			}
 
 			output, err := conn.DescribeConnections(ctx, &input)
-			if err != nil {
-				return fmt.Errorf("describing %s connection: %w", pair.label, err)
-			}
 
 			status := "<none>"
-			if len(output.Connections) > 0 {
+			switch {
+			case errs.IsA[*awstypes.ResourceNotFoundFault](err):
+				// No connection has been tested for this endpoint/instance pair
+				// yet. That is the reset state this check observes, not a
+				// failure.
+			case err != nil:
+				return fmt.Errorf("describing %s connection: %w", pair.label, err)
+			case len(output.Connections) > 0:
 				status = aws.ToString(output.Connections[0].Status)
 			}
 
@@ -1715,6 +1720,17 @@ func testAccReplicationTaskConfig_startAfterS3TargetModify(rName, attr string, v
 
 	return acctest.ConfigCompose(testAccReplicationConfigConfig_base_ValidDatabase(rName), fmt.Sprintf(`
 data "aws_partition" "current" {}
+data "aws_region" "current" {}
+
+# The base VPC has no IGW, NAT gateway, or S3 route otherwise, and the
+# replication instance is not publicly accessible, so without this gateway
+# endpoint DMS can never reach the S3 target and every step would fail for a
+# reason unrelated to the connection-reset behavior under test.
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id          = aws_vpc.test.id
+  service_name    = "com.amazonaws.${data.aws_region.current.name}.s3"
+  route_table_ids = [aws_vpc.test.main_route_table_id]
+}
 
 resource "aws_s3_bucket" "test1" {
   bucket        = "%[1]s-1"
@@ -1766,6 +1782,7 @@ resource "aws_iam_role_policy" "test1" {
       Effect = "Allow"
       Action = [
         "s3:PutObject",
+        "s3:PutObjectTagging",
         "s3:DeleteObject",
         "s3:GetObject",
         "s3:ListBucket",
@@ -1791,6 +1808,7 @@ resource "aws_iam_role_policy" "test2" {
       Effect = "Allow"
       Action = [
         "s3:PutObject",
+        "s3:PutObjectTagging",
         "s3:DeleteObject",
         "s3:GetObject",
         "s3:ListBucket",
@@ -1855,7 +1873,7 @@ resource "aws_dms_s3_endpoint" "target_s3" {
   encryption_mode                   = "SSE_KMS"
   server_side_encryption_kms_key_id = %[5]s
 
-  depends_on = [aws_iam_role_policy.test1, aws_iam_role_policy.test2]
+  depends_on = [aws_iam_role_policy.test1, aws_iam_role_policy.test2, aws_vpc_endpoint.s3]
 }
 
 resource "aws_dms_replication_task" "test" {
@@ -1887,6 +1905,7 @@ resource "aws_dms_replication_task" "test" {
     aws_rds_cluster_instance.source,
     aws_iam_role_policy.test1,
     aws_iam_role_policy.test2,
+    aws_vpc_endpoint.s3,
   ]
 }
 
