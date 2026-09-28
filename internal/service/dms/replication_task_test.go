@@ -15,6 +15,7 @@ import (
 	"github.com/YakDriver/regexache"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/arn"
+	"github.com/aws/aws-sdk-go-v2/service/databasemigrationservice"
 	awstypes "github.com/aws/aws-sdk-go-v2/service/databasemigrationservice/types"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
@@ -1482,6 +1483,424 @@ resource "aws_dms_replication_instance" "test2" {
   replication_subnet_group_id  = aws_dms_replication_subnet_group.test.replication_subnet_group_id
 }
 `, rName, arn))
+}
+
+func testAccCheckReplicationTaskConnectionsStatus(ctx context.Context, t *testing.T, n string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[n]
+		if !ok {
+			return fmt.Errorf("Not found: %s", n)
+		}
+
+		conn := acctest.ProviderMeta(ctx, t).DMSClient(ctx)
+
+		instanceARN := rs.Primary.Attributes["replication_instance_arn"]
+		pairs := []struct {
+			label string
+			arn   string
+		}{
+			{names.AttrSource, rs.Primary.Attributes["source_endpoint_arn"]},
+			{names.AttrTarget, rs.Primary.Attributes["target_endpoint_arn"]},
+		}
+
+		for _, pair := range pairs {
+			input := databasemigrationservice.DescribeConnectionsInput{
+				Filters: []awstypes.Filter{
+					{
+						Name:   aws.String("endpoint-arn"),
+						Values: []string{pair.arn},
+					},
+					{
+						Name:   aws.String("replication-instance-arn"),
+						Values: []string{instanceARN},
+					},
+				},
+			}
+
+			output, err := conn.DescribeConnections(ctx, &input)
+			if err != nil {
+				return fmt.Errorf("describing %s connection: %w", pair.label, err)
+			}
+
+			status := "<none>"
+			if len(output.Connections) > 0 {
+				status = aws.ToString(output.Connections[0].Status)
+			}
+
+			t.Logf("DMS connection %s/%s: status=%s", pair.label, "instance", status)
+		}
+
+		return nil
+	}
+}
+
+func TestAccDMSReplicationTask_startAfterMove(t *testing.T) {
+	ctx := acctest.Context(t)
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
+
+	rName := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	resourceName := "aws_dms_replication_task.test"
+	instanceTwo := "aws_dms_replication_instance.test2"
+	var v awstypes.ReplicationTask
+
+	acctest.ParallelTest(ctx, t, resource.TestCase{
+		PreCheck:                 func() { acctest.PreCheck(ctx, t) },
+		ErrorCheck:               acctest.ErrorCheck(t, names.DMSServiceID),
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories,
+		CheckDestroy:             testAccCheckReplicationTaskDestroy(ctx, t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccReplicationTaskConfig_startAfterMove(rName, "aws_dms_replication_instance.test.replication_instance_arn"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+					resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "running"),
+					testAccCheckReplicationTaskConnectionsStatus(ctx, t, resourceName),
+				),
+			},
+			{
+				Config: testAccReplicationTaskConfig_startAfterMove(rName, "aws_dms_replication_instance.test2.replication_instance_arn"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+					resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "running"),
+					resource.TestCheckResourceAttrPair(resourceName, "replication_instance_arn", instanceTwo, "replication_instance_arn"),
+					testAccCheckReplicationTaskConnectionsStatus(ctx, t, resourceName),
+				),
+			},
+		},
+	})
+}
+
+func testAccReplicationTaskConfig_startAfterMove(rName, instanceRef string) string {
+	return acctest.ConfigCompose(testAccReplicationConfigConfig_base_ValidDatabase(rName), fmt.Sprintf(`
+resource "aws_dms_replication_task" "test" {
+  replication_task_id      = %[1]q
+  migration_type           = "full-load-and-cdc"
+  replication_instance_arn = %[2]s
+  source_endpoint_arn      = aws_dms_endpoint.source.endpoint_arn
+  target_endpoint_arn      = aws_dms_endpoint.target.endpoint_arn
+  table_mappings = jsonencode(
+    {
+      "rules" = [
+        {
+          "rule-type" = "selection",
+          "rule-id"   = "1",
+          "rule-name" = "1",
+          "object-locator" = {
+            "schema-name" = "%%",
+            "table-name"  = "%%"
+          },
+          "rule-action" = "include"
+        }
+      ]
+    }
+  )
+
+  start_replication_task = true
+
+  depends_on = [aws_rds_cluster_instance.source, aws_rds_cluster_instance.target]
+}
+
+resource "aws_dms_replication_instance" "test" {
+  allocated_storage            = 5
+  auto_minor_version_upgrade   = true
+  replication_instance_class   = "dms.t3.medium"
+  replication_instance_id      = %[1]q
+  preferred_maintenance_window = "sun:00:30-sun:02:30"
+  publicly_accessible          = false
+  replication_subnet_group_id  = aws_dms_replication_subnet_group.test.replication_subnet_group_id
+  vpc_security_group_ids       = [aws_security_group.test.id]
+}
+
+resource "aws_dms_replication_instance" "test2" {
+  allocated_storage            = 5
+  auto_minor_version_upgrade   = true
+  replication_instance_class   = "dms.t3.medium"
+  replication_instance_id      = "%[1]s-2"
+  preferred_maintenance_window = "sun:00:30-sun:02:30"
+  publicly_accessible          = false
+  replication_subnet_group_id  = aws_dms_replication_subnet_group.test.replication_subnet_group_id
+  vpc_security_group_ids       = [aws_security_group.test.id]
+}
+`, rName, instanceRef))
+}
+
+func TestAccDMSReplicationTask_startAfterS3TargetModify(t *testing.T) {
+	t.Parallel()
+
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
+
+	for _, attr := range []string{
+		"bucket_folder",
+		names.AttrBucketName,
+		"service_access_role_arn",
+		"server_side_encryption_kms_key_id",
+	} { //nolint:paralleltest // false positive
+		t.Run(attr, func(t *testing.T) {
+			ctx := acctest.Context(t)
+			rName := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+			resourceName := "aws_dms_replication_task.test"
+			var v awstypes.ReplicationTask
+
+			acctest.ParallelTest(ctx, t, resource.TestCase{
+				PreCheck:                 func() { acctest.PreCheck(ctx, t) },
+				ErrorCheck:               acctest.ErrorCheck(t, names.DMSServiceID),
+				ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories,
+				CheckDestroy:             testAccCheckReplicationTaskDestroy(ctx, t),
+				Steps: []resource.TestStep{
+					{
+						Config: testAccReplicationTaskConfig_startAfterS3TargetModify(rName, attr, 1, true),
+						Check: resource.ComposeAggregateTestCheckFunc(
+							testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+							resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "running"),
+							testAccCheckReplicationTaskConnectionsStatus(ctx, t, resourceName),
+						),
+					},
+					{
+						Config: testAccReplicationTaskConfig_startAfterS3TargetModify(rName, attr, 1, false),
+						Check: resource.ComposeAggregateTestCheckFunc(
+							testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+							resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "stopped"),
+							testAccCheckReplicationTaskConnectionsStatus(ctx, t, resourceName),
+						),
+					},
+					{
+						Config: testAccReplicationTaskConfig_startAfterS3TargetModify(rName, attr, 2, false),
+						Check: resource.ComposeAggregateTestCheckFunc(
+							testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+							resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "stopped"),
+							testAccCheckReplicationTaskConnectionsStatus(ctx, t, resourceName),
+						),
+					},
+					{
+						Config: testAccReplicationTaskConfig_startAfterS3TargetModify(rName, attr, 2, true),
+						Check: resource.ComposeAggregateTestCheckFunc(
+							testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+							resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "running"),
+							testAccCheckReplicationTaskConnectionsStatus(ctx, t, resourceName),
+						),
+					},
+				},
+			})
+		})
+	}
+}
+
+// testAccReplicationTaskConfig_startAfterS3TargetModify builds a full-load-and-cdc
+// task from the Aurora source to an aws_dms_s3_endpoint target. variant selects the
+// value of attr (1 or 2); every other S3 endpoint attribute stays at its variant 1
+// value. This reproduces starting a task after an S3 target endpoint change, which
+// resets the connection's tested status.
+func testAccReplicationTaskConfig_startAfterS3TargetModify(rName, attr string, variant int, start bool) string {
+	bucketFolder := "a/"
+	bucketName := "aws_s3_bucket.test1.bucket"
+	serviceAccessRoleARN := "aws_iam_role.test1.arn"
+	kmsKeyID := "aws_kms_key.test1.arn"
+
+	if variant == 2 {
+		switch attr {
+		case "bucket_folder":
+			bucketFolder = "b/"
+		case names.AttrBucketName:
+			bucketName = "aws_s3_bucket.test2.bucket"
+		case "service_access_role_arn":
+			serviceAccessRoleARN = "aws_iam_role.test2.arn"
+		case "server_side_encryption_kms_key_id":
+			kmsKeyID = "aws_kms_key.test2.arn"
+		}
+	}
+
+	return acctest.ConfigCompose(testAccReplicationConfigConfig_base_ValidDatabase(rName), fmt.Sprintf(`
+data "aws_partition" "current" {}
+
+resource "aws_s3_bucket" "test1" {
+  bucket        = "%[1]s-1"
+  force_destroy = true
+}
+
+resource "aws_s3_bucket" "test2" {
+  bucket        = "%[1]s-2"
+  force_destroy = true
+}
+
+resource "aws_iam_role" "test1" {
+  name = "%[1]s-1"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "dms.${data.aws_partition.current.dns_suffix}"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role" "test2" {
+  name = "%[1]s-2"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "dms.${data.aws_partition.current.dns_suffix}"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "test1" {
+  name = "%[1]s-1"
+  role = aws_iam_role.test1.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+      ]
+      Resource = [
+        aws_s3_bucket.test1.arn,
+        "${aws_s3_bucket.test1.arn}/*",
+        aws_s3_bucket.test2.arn,
+        "${aws_s3_bucket.test2.arn}/*",
+      ]
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "test2" {
+  name = "%[1]s-2"
+  role = aws_iam_role.test2.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+      ]
+      Resource = [
+        aws_s3_bucket.test1.arn,
+        "${aws_s3_bucket.test1.arn}/*",
+        aws_s3_bucket.test2.arn,
+        "${aws_s3_bucket.test2.arn}/*",
+      ]
+    }]
+  })
+}
+
+resource "aws_kms_key" "test1" {
+  description             = "%[1]s-1"
+  deletion_window_in_days = 7
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Id      = "%[1]s-1"
+    Statement = [{
+      Sid    = "%[1]s-1"
+      Effect = "Allow"
+      Principal = {
+        AWS = "*"
+      }
+      Action   = "kms:*"
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_kms_key" "test2" {
+  description             = "%[1]s-2"
+  deletion_window_in_days = 7
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Id      = "%[1]s-2"
+    Statement = [{
+      Sid    = "%[1]s-2"
+      Effect = "Allow"
+      Principal = {
+        AWS = "*"
+      }
+      Action   = "kms:*"
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_dms_s3_endpoint" "target_s3" {
+  endpoint_id   = "%[1]s-target-s3"
+  endpoint_type = "target"
+  ssl_mode      = "none"
+
+  bucket_folder                     = %[2]q
+  bucket_name                       = %[3]s
+  service_access_role_arn           = %[4]s
+  encryption_mode                   = "SSE_KMS"
+  server_side_encryption_kms_key_id = %[5]s
+
+  depends_on = [aws_iam_role_policy.test1, aws_iam_role_policy.test2]
+}
+
+resource "aws_dms_replication_task" "test" {
+  replication_task_id      = %[1]q
+  migration_type           = "full-load-and-cdc"
+  replication_instance_arn = aws_dms_replication_instance.test.replication_instance_arn
+  source_endpoint_arn      = aws_dms_endpoint.source.endpoint_arn
+  target_endpoint_arn      = aws_dms_s3_endpoint.target_s3.endpoint_arn
+  table_mappings = jsonencode(
+    {
+      "rules" = [
+        {
+          "rule-type" = "selection",
+          "rule-id"   = "1",
+          "rule-name" = "1",
+          "object-locator" = {
+            "schema-name" = "%%",
+            "table-name"  = "%%"
+          },
+          "rule-action" = "include"
+        }
+      ]
+    }
+  )
+
+  start_replication_task = %[6]t
+
+  depends_on = [
+    aws_rds_cluster_instance.source,
+    aws_iam_role_policy.test1,
+    aws_iam_role_policy.test2,
+  ]
+}
+
+resource "aws_dms_replication_instance" "test" {
+  allocated_storage            = 5
+  auto_minor_version_upgrade   = true
+  replication_instance_class   = "dms.t3.medium"
+  replication_instance_id      = %[1]q
+  preferred_maintenance_window = "sun:00:30-sun:02:30"
+  publicly_accessible          = false
+  replication_subnet_group_id  = aws_dms_replication_subnet_group.test.replication_subnet_group_id
+  vpc_security_group_ids       = [aws_security_group.test.id]
+}
+`, rName, bucketFolder, bucketName, serviceAccessRoleARN, kmsKeyID, start))
 }
 
 var (
