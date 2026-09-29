@@ -1922,6 +1922,186 @@ resource "aws_dms_replication_instance" "test" {
 `, rName, bucketFolder, bucketName, serviceAccessRoleARN, kmsKeyID, start))
 }
 
+func TestAccDMSReplicationTask_startAfterMoveSharedEndpoints(t *testing.T) {
+	ctx := acctest.Context(t)
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
+
+	const taskCount = 3
+	rName := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	instanceTwo := "aws_dms_replication_instance.test2"
+	var v awstypes.ReplicationTask
+
+	var createChecks, moveChecks []resource.TestCheckFunc
+	for i := range taskCount {
+		resourceName := fmt.Sprintf("aws_dms_replication_task.test.%d", i)
+
+		createChecks = append(createChecks,
+			testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+			resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "running"),
+			testAccCheckReplicationTaskConnectionsStatus(ctx, t, resourceName),
+		)
+		moveChecks = append(moveChecks,
+			testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+			resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "running"),
+			resource.TestCheckResourceAttrPair(resourceName, "replication_instance_arn", instanceTwo, "replication_instance_arn"),
+			testAccCheckReplicationTaskConnectionsStatus(ctx, t, resourceName),
+		)
+	}
+
+	acctest.ParallelTest(ctx, t, resource.TestCase{
+		PreCheck:                 func() { acctest.PreCheck(ctx, t) },
+		ErrorCheck:               acctest.ErrorCheck(t, names.DMSServiceID),
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories,
+		CheckDestroy:             testAccCheckReplicationTaskDestroy(ctx, t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccReplicationTaskConfig_startAfterMoveSharedEndpoints(rName, "test", taskCount),
+				Check:  resource.ComposeAggregateTestCheckFunc(createChecks...),
+			},
+			{
+				Config: testAccReplicationTaskConfig_startAfterMoveSharedEndpoints(rName, "test2", taskCount),
+				Check:  resource.ComposeAggregateTestCheckFunc(moveChecks...),
+			},
+		},
+	})
+}
+
+// testAccReplicationTaskConfig_startAfterMoveSharedEndpoints builds taskCount
+// full-load-and-cdc tasks that share one Aurora source endpoint and one
+// aws_dms_s3_endpoint target, all on the replication instance named by
+// instanceName ("test" or "test2"). Changing instanceName moves every task to
+// the other instance in the same apply, so DMS tests the new instance and
+// shared endpoint connections once per move while the tasks start.
+func testAccReplicationTaskConfig_startAfterMoveSharedEndpoints(rName, instanceName string, taskCount int) string {
+	return acctest.ConfigCompose(testAccReplicationConfigConfig_base_ValidDatabase(rName), fmt.Sprintf(`
+data "aws_partition" "current" {}
+data "aws_region" "current" {}
+
+# The base VPC has no IGW, NAT gateway, or S3 route otherwise, and the
+# replication instances are not publicly accessible, so without this gateway
+# endpoint DMS can never reach the S3 target.
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id          = aws_vpc.test.id
+  service_name    = "com.amazonaws.${data.aws_region.current.region}.s3"
+  route_table_ids = [aws_vpc.test.main_route_table_id]
+}
+
+resource "aws_s3_bucket" "test1" {
+  bucket        = "%[1]s-1"
+  force_destroy = true
+}
+
+resource "aws_iam_role" "test1" {
+  name = "%[1]s-1"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "dms.${data.aws_partition.current.dns_suffix}"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "test1" {
+  name = "%[1]s-1"
+  role = aws_iam_role.test1.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "s3:PutObject",
+        "s3:PutObjectTagging",
+        "s3:DeleteObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+      ]
+      Resource = [
+        aws_s3_bucket.test1.arn,
+        "${aws_s3_bucket.test1.arn}/*",
+      ]
+    }]
+  })
+}
+
+resource "aws_dms_s3_endpoint" "target_s3" {
+  endpoint_id   = "%[1]s-target-s3"
+  endpoint_type = "target"
+  ssl_mode      = "none"
+
+  bucket_folder           = "a/"
+  bucket_name             = aws_s3_bucket.test1.bucket
+  service_access_role_arn = aws_iam_role.test1.arn
+
+  depends_on = [aws_iam_role_policy.test1, aws_vpc_endpoint.s3]
+}
+
+resource "aws_dms_replication_task" "test" {
+  count = %[3]d
+
+  replication_task_id      = "%[1]s-${count.index}"
+  migration_type           = "full-load-and-cdc"
+  replication_instance_arn = aws_dms_replication_instance.%[2]s.replication_instance_arn
+  source_endpoint_arn      = aws_dms_endpoint.source.endpoint_arn
+  target_endpoint_arn      = aws_dms_s3_endpoint.target_s3.endpoint_arn
+  table_mappings = jsonencode(
+    {
+      "rules" = [
+        {
+          "rule-type" = "selection",
+          "rule-id"   = "1",
+          "rule-name" = "1",
+          "object-locator" = {
+            "schema-name" = "%%",
+            "table-name"  = "%%"
+          },
+          "rule-action" = "include"
+        }
+      ]
+    }
+  )
+
+  start_replication_task = true
+
+  depends_on = [
+    aws_rds_cluster_instance.source,
+    aws_iam_role_policy.test1,
+    aws_vpc_endpoint.s3,
+  ]
+}
+
+resource "aws_dms_replication_instance" "test" {
+  allocated_storage            = 5
+  auto_minor_version_upgrade   = true
+  replication_instance_class   = "dms.t3.medium"
+  replication_instance_id      = %[1]q
+  preferred_maintenance_window = "sun:00:30-sun:02:30"
+  publicly_accessible          = false
+  replication_subnet_group_id  = aws_dms_replication_subnet_group.test.replication_subnet_group_id
+  vpc_security_group_ids       = [aws_security_group.test.id]
+}
+
+resource "aws_dms_replication_instance" "test2" {
+  allocated_storage            = 5
+  auto_minor_version_upgrade   = true
+  replication_instance_class   = "dms.t3.medium"
+  replication_instance_id      = "%[1]s-2"
+  preferred_maintenance_window = "sun:00:30-sun:02:30"
+  publicly_accessible          = false
+  replication_subnet_group_id  = aws_dms_replication_subnet_group.test.replication_subnet_group_id
+  vpc_security_group_ids       = [aws_security_group.test.id]
+}
+`, rName, instanceName, taskCount))
+}
+
 var (
 	defaultReplicationTaskSettings = map[awstypes.MigrationTypeValue]string{
 		awstypes.MigrationTypeValueCdc:            defaultReplicationTaskCdcSettings,
