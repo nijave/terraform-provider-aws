@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/arn"
 	dms "github.com/aws/aws-sdk-go-v2/service/databasemigrationservice"
 	awstypes "github.com/aws/aws-sdk-go-v2/service/databasemigrationservice/types"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
@@ -531,6 +532,95 @@ func TestAccDMSReplicationTask_updateWhileStopping(t *testing.T) {
 			},
 		},
 	})
+}
+
+func TestAccDMSReplicationTask_updateWhileTesting(t *testing.T) {
+	ctx := acctest.Context(t)
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
+
+	rName := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	resourceName := "aws_dms_replication_task.test"
+	var v awstypes.ReplicationTask
+
+	acctest.ParallelTest(ctx, t, resource.TestCase{
+		PreCheck:                 func() { acctest.PreCheck(ctx, t) },
+		ErrorCheck:               acctest.ErrorCheck(t, names.DMSServiceID),
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories,
+		CheckDestroy:             testAccCheckReplicationTaskDestroy(ctx, t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccReplicationTaskConfig_updateWhileTesting(rName, "testrule", false),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+					resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "ready"),
+				),
+			},
+			{
+				// DMS reports a task as "testing" while a premigration assessment
+				// run for it is in progress. Start one out of band, so the next
+				// apply finds the task in that state.
+				PreConfig: func() {
+					iamConn := acctest.ProviderMeta(ctx, t).IAMClient(ctx)
+					roleInput := iam.GetRoleInput{
+						RoleName: aws.String(rName),
+					}
+					role, err := iamConn.GetRole(ctx, &roleInput)
+					if err != nil {
+						t.Fatalf("reading IAM Role (%s): %s", rName, err)
+					}
+
+					conn := acctest.ProviderMeta(ctx, t).DMSClient(ctx)
+					input := dms.StartReplicationTaskAssessmentRunInput{
+						AssessmentRunName:    aws.String(rName),
+						IncludeOnly:          []string{"mysql-check-binlog-format"},
+						ReplicationTaskArn:   v.ReplicationTaskArn,
+						ResultLocationBucket: aws.String(rName),
+						ServiceAccessRoleArn: role.Role.Arn,
+					}
+					if _, err := conn.StartReplicationTaskAssessmentRun(ctx, &input); err != nil {
+						t.Fatalf("starting DMS Replication Task Assessment Run: %s", err)
+					}
+
+					testAccWaitReplicationTaskStatus(ctx, t, aws.ToString(v.ReplicationTaskIdentifier), []string{"ready"}, "testing")
+				},
+				Config: testAccReplicationTaskConfig_updateWhileTesting(rName, "changedtestrule", true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+					resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "running"),
+				),
+			},
+		},
+	})
+}
+
+// testAccWaitReplicationTaskStatus waits until DMS reports the task in the
+// target status. Any status other than pending or target fails the test, so a
+// following step can't start from the wrong state.
+func testAccWaitReplicationTaskStatus(ctx context.Context, t *testing.T, id string, pending []string, target string) {
+	t.Helper()
+
+	conn := acctest.ProviderMeta(ctx, t).DMSClient(ctx)
+	stateConf := &retry.StateChangeConf{
+		Pending: pending,
+		Target:  []string{target},
+		Refresh: func(ctx context.Context) (any, string, error) {
+			output, err := tfdms.FindReplicationTaskByID(ctx, conn, id)
+
+			if err != nil {
+				return nil, "", err
+			}
+
+			return output, aws.ToString(output.Status), nil
+		},
+		Timeout:    10 * time.Minute,
+		MinTimeout: 5 * time.Second,
+	}
+
+	if _, err := stateConf.WaitForStateContext(ctx); err != nil {
+		t.Fatalf("waiting for DMS Replication Task (%s) status %q: %s", id, target, err)
+	}
 }
 
 func TestAccDMSReplicationTask_s3ToRDS(t *testing.T) {
@@ -1145,6 +1235,94 @@ resource "aws_dms_replication_instance" "test" {
   vpc_security_group_ids       = [aws_security_group.test.id]
 }
 `, rName, ruleName))
+}
+
+func testAccReplicationTaskConfig_updateWhileTesting(rName, ruleName string, startTask bool) string {
+	return acctest.ConfigCompose(testAccReplicationConfigConfig_base_ValidDatabase(rName), fmt.Sprintf(`
+data "aws_partition" "current" {}
+
+resource "aws_s3_bucket" "test" {
+  bucket        = %[1]q
+  force_destroy = true
+}
+
+resource "aws_iam_role" "test" {
+  name = %[1]q
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "dms.${data.aws_partition.current.dns_suffix}"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "test" {
+  name = %[1]q
+  role = aws_iam_role.test.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "s3:GetBucketLocation",
+        "s3:ListBucket",
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ]
+      Resource = [
+        aws_s3_bucket.test.arn,
+        "${aws_s3_bucket.test.arn}/*"
+      ]
+    }]
+  })
+}
+
+resource "aws_dms_replication_task" "test" {
+  replication_task_id      = %[1]q
+  migration_type           = "full-load-and-cdc"
+  replication_instance_arn = aws_dms_replication_instance.test.replication_instance_arn
+  source_endpoint_arn      = aws_dms_endpoint.source.endpoint_arn
+  target_endpoint_arn      = aws_dms_endpoint.target.endpoint_arn
+  table_mappings = jsonencode(
+    {
+      "rules" = [
+        {
+          "rule-type" = "selection",
+          "rule-id"   = "1",
+          "rule-name" = %[2]q,
+          "object-locator" = {
+            "schema-name" = "%%",
+            "table-name"  = "%%"
+          },
+          "rule-action" = "include"
+        }
+      ]
+    }
+  )
+
+  start_replication_task = %[3]t
+
+  depends_on = [aws_rds_cluster_instance.source, aws_rds_cluster_instance.target, aws_iam_role_policy.test]
+}
+
+resource "aws_dms_replication_instance" "test" {
+  allocated_storage            = 5
+  auto_minor_version_upgrade   = true
+  replication_instance_class   = "dms.t3.medium"
+  replication_instance_id      = %[1]q
+  preferred_maintenance_window = "sun:00:30-sun:02:30"
+  publicly_accessible          = false
+  replication_subnet_group_id  = aws_dms_replication_subnet_group.test.replication_subnet_group_id
+  vpc_security_group_ids       = [aws_security_group.test.id]
+}
+`, rName, ruleName, startTask))
 }
 
 func testAccReplicationTaskConfig_s3ToRDS(rName string) string {
