@@ -595,6 +595,61 @@ func TestAccDMSReplicationTask_updateWhileTesting(t *testing.T) {
 	})
 }
 
+func TestAccDMSReplicationTask_updateWhileMoving(t *testing.T) {
+	ctx := acctest.Context(t)
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
+
+	rName := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	resourceName := "aws_dms_replication_task.test"
+	instanceTwo := "aws_dms_replication_instance.test2"
+	var v awstypes.ReplicationTask
+
+	acctest.ParallelTest(ctx, t, resource.TestCase{
+		PreCheck:                 func() { acctest.PreCheck(ctx, t) },
+		ErrorCheck:               acctest.ErrorCheck(t, names.DMSServiceID),
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories,
+		CheckDestroy:             testAccCheckReplicationTaskDestroy(ctx, t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccReplicationTaskConfig_updateWhileMoving(rName, "testrule", false),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+					resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "ready"),
+				),
+			},
+			{
+				// Ask DMS to move the task to the second instance without
+				// waiting, so the next apply finds it in the "moving" state.
+				PreConfig: func() {
+					conn := acctest.ProviderMeta(ctx, t).DMSClient(ctx)
+					instance, err := tfdms.FindReplicationInstanceByID(ctx, conn, rName+"-2")
+					if err != nil {
+						t.Fatalf("reading DMS Replication Instance (%s-2): %s", rName, err)
+					}
+
+					input := dms.MoveReplicationTaskInput{
+						ReplicationTaskArn:           v.ReplicationTaskArn,
+						TargetReplicationInstanceArn: instance.ReplicationInstanceArn,
+					}
+					if _, err := conn.MoveReplicationTask(ctx, &input); err != nil {
+						t.Fatalf("moving DMS Replication Task: %s", err)
+					}
+
+					testAccWaitReplicationTaskStatus(ctx, t, aws.ToString(v.ReplicationTaskIdentifier), []string{"ready"}, "moving")
+				},
+				Config: testAccReplicationTaskConfig_updateWhileMoving(rName, "changedtestrule", true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testAccCheckReplicationTaskExists(ctx, t, resourceName, &v),
+					resource.TestCheckResourceAttr(resourceName, names.AttrStatus, "running"),
+					resource.TestCheckResourceAttrPair(resourceName, "replication_instance_arn", instanceTwo, "replication_instance_arn"),
+				),
+			},
+		},
+	})
+}
+
 // testAccWaitReplicationTaskStatus waits until DMS reports the task in the
 // target status. Any status other than pending or target fails the test, so a
 // following step can't start from the wrong state.
@@ -1317,6 +1372,68 @@ resource "aws_dms_replication_instance" "test" {
   auto_minor_version_upgrade   = true
   replication_instance_class   = "dms.t3.medium"
   replication_instance_id      = %[1]q
+  preferred_maintenance_window = "sun:00:30-sun:02:30"
+  publicly_accessible          = false
+  replication_subnet_group_id  = aws_dms_replication_subnet_group.test.replication_subnet_group_id
+  vpc_security_group_ids       = [aws_security_group.test.id]
+}
+`, rName, ruleName, startTask))
+}
+
+func testAccReplicationTaskConfig_updateWhileMoving(rName, ruleName string, startTask bool) string {
+	return acctest.ConfigCompose(testAccReplicationConfigConfig_base_ValidDatabase(rName), fmt.Sprintf(`
+resource "aws_dms_replication_task" "test" {
+  replication_task_id      = %[1]q
+  migration_type           = "full-load-and-cdc"
+  replication_instance_arn = aws_dms_replication_instance.test.replication_instance_arn
+  source_endpoint_arn      = aws_dms_endpoint.source.endpoint_arn
+  target_endpoint_arn      = aws_dms_endpoint.target.endpoint_arn
+  table_mappings = jsonencode(
+    {
+      "rules" = [
+        {
+          "rule-type" = "selection",
+          "rule-id"   = "1",
+          "rule-name" = %[2]q,
+          "object-locator" = {
+            "schema-name" = "%%",
+            "table-name"  = "%%"
+          },
+          "rule-action" = "include"
+        }
+      ]
+    }
+  )
+
+  start_replication_task = %[3]t
+
+  # The test moves the task to aws_dms_replication_instance.test2 out of band,
+  # so the task must be destroyed before that instance.
+  depends_on = [aws_rds_cluster_instance.source, aws_rds_cluster_instance.target, aws_dms_replication_instance.test2]
+
+  # Without this, the plan after the out-of-band move would depend on which
+  # instance DMS reports while the move is still in progress.
+  lifecycle {
+    ignore_changes = [replication_instance_arn]
+  }
+}
+
+resource "aws_dms_replication_instance" "test" {
+  allocated_storage            = 5
+  auto_minor_version_upgrade   = true
+  replication_instance_class   = "dms.t3.medium"
+  replication_instance_id      = %[1]q
+  preferred_maintenance_window = "sun:00:30-sun:02:30"
+  publicly_accessible          = false
+  replication_subnet_group_id  = aws_dms_replication_subnet_group.test.replication_subnet_group_id
+  vpc_security_group_ids       = [aws_security_group.test.id]
+}
+
+resource "aws_dms_replication_instance" "test2" {
+  allocated_storage            = 5
+  auto_minor_version_upgrade   = true
+  replication_instance_class   = "dms.t3.medium"
+  replication_instance_id      = "%[1]s-2"
   preferred_maintenance_window = "sun:00:30-sun:02:30"
   publicly_accessible          = false
   replication_subnet_group_id  = aws_dms_replication_subnet_group.test.replication_subnet_group_id
