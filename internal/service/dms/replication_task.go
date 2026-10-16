@@ -240,7 +240,8 @@ func resourceReplicationTaskUpdate(ctx context.Context, d *schema.ResourceData, 
 		}
 
 		if slices.Contains(replicationTaskSteadyPendingStatuses, aws.ToString(task.Status)) {
-			if _, err := waitReplicationTaskSteady(ctx, conn, d.Id()); err != nil {
+			// A move can take longer than 5 minutes to settle.
+			if _, err := waitReplicationTaskSteady(ctx, conn, d.Id(), 15*time.Minute); err != nil {
 				return sdkdiag.AppendErrorf(diags, "waiting for DMS Replication Task (%s) steady state: %s", d.Id(), err)
 			}
 		}
@@ -594,10 +595,7 @@ var (
 	}
 )
 
-func waitReplicationTaskSteady(ctx context.Context, conn *dms.Client, id string) (*awstypes.ReplicationTask, error) {
-	const (
-		timeout = 5 * time.Minute
-	)
+func waitReplicationTaskSteady(ctx context.Context, conn *dms.Client, id string, timeout time.Duration) (*awstypes.ReplicationTask, error) {
 	stateConf := &retry.StateChangeConf{
 		Pending:                   replicationTaskSteadyPendingStatuses,
 		Target:                    replicationTaskSteadyTargetStatuses,

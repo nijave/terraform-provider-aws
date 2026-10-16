@@ -1792,7 +1792,7 @@ func steadyEndpointReplicationTasks(ctx context.Context, conn *dms.Client, arn s
 		case replicationTaskStatusRunning, replicationTaskStatusFailed, replicationTaskStatusReady, replicationTaskStatusStopped:
 			continue
 		case replicationTaskStatusCreating, replicationTaskStatusDeleting, replicationTaskStatusModifying, replicationTaskStatusStopping, replicationTaskStatusStarting:
-			if _, err := waitReplicationTaskSteady(ctx, conn, rtID); err != nil {
+			if _, err := waitReplicationTaskSteady(ctx, conn, rtID, 5*time.Minute); err != nil {
 				return err
 			}
 		}
